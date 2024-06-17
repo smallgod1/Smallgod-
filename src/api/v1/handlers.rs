@@ -1,9 +1,9 @@
 use super::types::{AppDataQuery, ClientResponse, ConfidenceResponse, LatestBlockResponse, Status};
 use crate::{
 	api::v1::types::{Extrinsics, ExtrinsicsDataResponse},
-	data::{Database, Key},
+	data::{AchievedConfidenceKey, AppDataKey, Database, VerifiedCellCountKey},
 	network::rpc::cell_count_for_confidence,
-	types::{Mode, OptionBlockRange, RuntimeConfig, State},
+	types::{Mode, OptionBlockRange, RuntimeConfig},
 	utils::calculate_confidence,
 };
 use avail_subxt::{
@@ -14,7 +14,6 @@ use base64::{engine::general_purpose, Engine};
 use codec::Decode;
 use color_eyre::{eyre::WrapErr, Result};
 use num::{BigUint, FromPrimitive};
-use std::sync::{Arc, Mutex};
 use tracing::{debug, info};
 
 fn serialised_confidence(block: u32, factor: f64) -> Option<String> {
@@ -31,12 +30,14 @@ pub fn mode(app_id: Option<u32>) -> ClientResponse<Mode> {
 pub fn confidence(
 	block_num: u32,
 	db: impl Database,
-	state: Arc<Mutex<State>>,
 	cfg: RuntimeConfig,
 ) -> ClientResponse<ConfidenceResponse> {
-	fn is_synced(block_num: u32, state: Arc<Mutex<State>>) -> bool {
-		let state = state.lock().unwrap();
-		match &state.confidence_achieved {
+	fn is_synced(block_num: u32, db: impl Database) -> bool {
+		match db
+			.get(AchievedConfidenceKey)
+			.expect("Achieved Confidence could not be fetched from the DB.")
+			.unwrap_or(None)
+		{
 			Some(range) => block_num <= range.last,
 			None => false,
 		}
@@ -44,9 +45,9 @@ pub fn confidence(
 
 	info!("Got request for confidence for block {block_num}");
 
-	let count = match db.get(Key::VerifiedCellCount(block_num)) {
+	let count = match db.get(VerifiedCellCountKey(block_num)) {
 		Ok(Some(count)) => count,
-		Ok(None) if is_synced(block_num, state) => cell_count_for_confidence(cfg.confidence),
+		Ok(None) if is_synced(block_num, db) => cell_count_for_confidence(cfg.confidence),
 		Ok(None) => return ClientResponse::NotFinalized,
 		Err(error) => return ClientResponse::Error(error),
 	};
@@ -63,16 +64,16 @@ pub fn confidence(
 	response
 }
 
-pub fn status(
-	app_id: Option<u32>,
-	state: Arc<Mutex<State>>,
-	db: impl Database,
-) -> ClientResponse<Status> {
-	let state = state.lock().unwrap();
-	let Some(last) = state.confidence_achieved.last() else {
+pub fn status(app_id: Option<u32>, db: impl Database) -> ClientResponse<Status> {
+	let Some(last) = db
+		.get(AchievedConfidenceKey)
+		.expect("Achieved Confidence could not be fetched from the DB.")
+		.unwrap_or(None)
+		.last()
+	else {
 		return ClientResponse::NotFound;
 	};
-	let res = match db.get(Key::VerifiedCellCount(last)) {
+	let res = match db.get(VerifiedCellCountKey(last)) {
 		Ok(Some(count)) => {
 			let confidence = calculate_confidence(count);
 			ClientResponse::Normal(Status {
@@ -89,10 +90,14 @@ pub fn status(
 	res
 }
 
-pub fn latest_block(state: Arc<Mutex<State>>) -> ClientResponse<LatestBlockResponse> {
+pub fn latest_block(db: impl Database) -> ClientResponse<LatestBlockResponse> {
 	info!("Got request for latest block");
-	let state = state.lock().unwrap();
-	match state.confidence_achieved.last() {
+	match db
+		.get(AchievedConfidenceKey)
+		.expect("Achieved Confidence could not be fetched from the DB.")
+		.unwrap_or(None)
+		.last()
+	{
 		None => ClientResponse::NotFound,
 		Some(latest_block) => ClientResponse::Normal(LatestBlockResponse { latest_block }),
 	}
@@ -103,7 +108,6 @@ pub fn appdata(
 	query: AppDataQuery,
 	db: impl Database,
 	app_id: Option<u32>,
-	state: Arc<Mutex<State>>,
 ) -> ClientResponse<ExtrinsicsDataResponse> {
 	fn decode_app_data_to_extrinsics(
 		data: Result<Option<Vec<Vec<u8>>>>,
@@ -127,11 +131,14 @@ pub fn appdata(
 		}
 	}
 	info!("Got request for AppData for block {block_num}");
-	let state = state.lock().unwrap();
-	let last = state.confidence_achieved.last();
+	let last = db
+		.get(AchievedConfidenceKey)
+		.expect("Achieved Confidence could not be fetched from the DB.")
+		.unwrap_or(None)
+		.last();
 	let decode = query.decode.unwrap_or(false);
 	let res = match decode_app_data_to_extrinsics(
-		db.get(Key::AppData(app_id.unwrap_or(0u32), block_num)),
+		db.get(AppDataKey(app_id.unwrap_or(0u32), block_num)),
 	) {
 		Ok(Some(data)) => {
 			if !decode {

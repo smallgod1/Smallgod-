@@ -16,12 +16,15 @@
 //! In case RPC is disabled, RPC calls will be skipped.
 
 use crate::{
-	data::{Database, Key},
+	data::{
+		AchievedSyncConfidenceKey, BlockHeaderKey, Database, IsSyncedKey, LatestSyncKey,
+		VerifiedCellCountKey, VerifiedSyncHeaderKey,
+	},
 	network::{
 		self,
 		rpc::{self, Client as RpcClient},
 	},
-	types::{BlockVerified, OptionBlockRange, State, SyncClientConfig},
+	types::{BlockVerified, OptionBlockRange, SyncClientConfig},
 	utils::{calculate_confidence, extract_kate},
 };
 
@@ -35,11 +38,7 @@ use color_eyre::{
 use kate_recovery::{commitments, matrix::Dimensions};
 use mockall::automock;
 use sp_core::blake2_256;
-use std::{
-	ops::Range,
-	sync::{Arc, Mutex},
-	time::Instant,
-};
+use std::{ops::Range, time::Instant};
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
@@ -48,17 +47,21 @@ use tracing::{error, info, warn};
 pub trait Client {
 	async fn get_header_by_block_number(&self, block_number: u32) -> Result<(DaHeader, H256)>;
 	fn is_confidence_stored(&self, block_number: u32) -> Result<bool>;
-	fn store_confidence(&self, count: u32, block_number: u32) -> Result<()>;
+	fn store_verified_cell_count(&self, count: u32, block_number: u32) -> Result<()>;
+	fn store_achieved_sync_confidence(&self, block_number: u32) -> Result<()>;
+	fn store_verified_sync_header(&self, block_number: u32) -> Result<()>;
+	fn store_latest_sync(&self, block_number: u32) -> Result<()>;
+	fn store_is_synced(&self, is_synced: bool) -> Result<()>;
 }
 
 #[derive(Clone)]
 pub struct SyncClient<T: Database + Sync> {
 	db: T,
-	rpc_client: RpcClient,
+	rpc_client: RpcClient<T>,
 }
 
 impl<T: Database + Sync> SyncClient<T> {
-	pub fn new(db: T, rpc_client: RpcClient) -> Self {
+	pub fn new(db: T, rpc_client: RpcClient<T>) -> Self {
 		SyncClient { db, rpc_client }
 	}
 }
@@ -68,44 +71,85 @@ impl<T: Database + Sync> Client for SyncClient<T> {
 	async fn get_header_by_block_number(&self, block_number: u32) -> Result<(DaHeader, H256)> {
 		if let Some(header) = self
 			.db
-			.get(Key::BlockHeader(block_number))
-			.wrap_err("Sync Client failed to get Block Header from the storage")?
+			.get(BlockHeaderKey(block_number))
+			.wrap_err("Sync Client failed to get Block Header from the DB.")?
 		{
 			let hash: H256 = Encode::using_encoded(&header, blake2_256).into();
 			return Ok((header, hash));
 		}
 
-		let (header, hash) = match self
-			.rpc_client
-			.get_header_by_block_number(block_number)
-			.await
-			.wrap_err_with(|| {
-				format!(
-					"Sync Client failed to get Block {block_number:#?} by Block Number from storage",
-				)
-			}) {
-			Ok(value) => value,
-			Err(error) => return Err(error),
-		};
+		let (header, hash) =
+			match self
+				.rpc_client
+				.get_header_by_block_number(block_number)
+				.await
+				.wrap_err_with(|| {
+					format!("Sync Client failed to get Block {block_number:#?} by Block Number from DB.",)
+				}) {
+				Ok(value) => value,
+				Err(error) => return Err(error),
+			};
 
 		self.db
-			.put(Key::BlockHeader(block_number), header.clone())
-			.wrap_err("Sync Client failed to store Block Header")?;
+			.put(BlockHeaderKey(block_number), header.clone())
+			.wrap_err("Sync Client failed to store Block Header in DB.")?;
 
 		Ok((header, hash))
 	}
 
 	fn is_confidence_stored(&self, block_number: u32) -> Result<bool> {
 		self.db
-			.get(Key::VerifiedCellCount(block_number))
-			.wrap_err("Sync Client failed to check if Confidence Factor is stored")
+			.get(VerifiedCellCountKey(block_number))
+			.wrap_err("Sync Client failed to check if Confidence Factor is stored in DB.")
 			.map(|c: Option<u32>| c.is_some())
 	}
 
-	fn store_confidence(&self, count: u32, block_number: u32) -> Result<()> {
+	fn store_verified_cell_count(&self, count: u32, block_number: u32) -> Result<()> {
 		self.db
-			.put(Key::VerifiedCellCount(block_number), count)
-			.wrap_err("Sync Client failed to store Confidence Factor")
+			.put(VerifiedCellCountKey(block_number), count)
+			.wrap_err("Sync Client failed to store Verified Cell Count into DB.")
+	}
+
+	fn store_achieved_sync_confidence(&self, block_number: u32) -> Result<()> {
+		// get the current BlockRange stored in DB under this key
+		let mut block_range = self
+			.db
+			.get(AchievedSyncConfidenceKey)
+			.wrap_err("Sync Client failed to fetch Achieved Sync Confidence from DB.")?
+			.unwrap_or(None);
+		// mutate the value
+		block_range.set(block_number);
+		// store mutated value back in the DB
+		self.db
+			.put(AchievedSyncConfidenceKey, block_range)
+			.wrap_err("Sync Client failed to store Achieved Sync Confidence in DB.")
+	}
+
+	fn store_verified_sync_header(&self, block_number: u32) -> Result<()> {
+		// get the current BlockRange stored in DB under this key
+		let mut block_range = self
+			.db
+			.get(VerifiedSyncHeaderKey)
+			.wrap_err("Sync Client failed to fetch Verified Sync Header from DB.")?
+			.unwrap_or(None);
+		// mutate the value
+		block_range.set(block_number);
+		// store mutated value back in the DB
+		self.db
+			.put(VerifiedSyncHeaderKey, block_range)
+			.wrap_err("Sync Client failed to store Verified Sync Header in DB.")
+	}
+
+	fn store_latest_sync(&self, block_number: u32) -> Result<()> {
+		self.db
+			.put(LatestSyncKey, Some(block_number))
+			.wrap_err("Sync Client failed to store Achieved Sync Confidence in DB.")
+	}
+
+	fn store_is_synced(&self, is_synced: bool) -> Result<()> {
+		self.db
+			.put(IsSyncedKey, Some(is_synced))
+			.wrap_err("Sync Client failed to store IsSynced flag in DB.")
 	}
 }
 
@@ -156,8 +200,8 @@ async fn process_block(
 		return Ok(());
 	}
 
-	// write confidence factor into on-disk database
-	client.store_confidence(verified.try_into()?, block_number)?;
+	// write verified cell count into on-disk database
+	client.store_verified_cell_count(verified.try_into()?, block_number)?;
 
 	let confidence = Some(calculate_confidence(verified as u32));
 	let client_msg =
@@ -184,7 +228,6 @@ pub async fn run(
 	cfg: SyncClientConfig,
 	sync_range: Range<u32>,
 	block_verified_sender: broadcast::Sender<BlockVerified>,
-	state: Arc<Mutex<State>>,
 ) {
 	if sync_range.is_empty() {
 		warn!("There are no blocks to sync for range {sync_range:?}");
@@ -217,11 +260,14 @@ pub async fn run(
 			},
 		};
 
-		{
-			let mut state = state.lock().unwrap();
-			state.sync_latest.replace(block_number);
-			// TODO: Add proper header verification on sync
-			state.sync_header_verified.set(block_number);
+		if let Err(error) = client.store_latest_sync(block_number) {
+			error!(block_number, "Cannot process block: {error:#}");
+			continue;
+		};
+		// TODO: Add proper header verification on sync
+		if let Err(error) = client.store_verified_sync_header(block_number) {
+			error!(block_number, "Cannot process block: {error:#}");
+			continue;
 		}
 
 		// TODO: Should we handle unprocessed blocks differently?
@@ -237,14 +283,15 @@ pub async fn run(
 		.await
 		{
 			error!(block_number, "Cannot process block: {error:#}");
-		} else {
-			let mut state = state.lock().unwrap();
-			state.sync_confidence_achieved.set(block_number);
+		} else if let Err(error) = client.store_achieved_sync_confidence(block_number) {
+			error!(block_number, "Cannot process block: {error:#}");
 		}
 	}
 
 	if cfg.is_last_step {
-		state.lock().unwrap().synced.replace(true);
+		client
+			.store_is_synced(true)
+			.expect("Sync Client couldn't store IsSynced flag in DB.");
 	}
 }
 
@@ -378,7 +425,7 @@ mod tests {
 			.with(eq(2))
 			.returning(|_| Ok(true));
 		mock_client
-			.expect_store_confidence()
+			.expect_store_verified_cell_count()
 			.withf(move |_, block_number| *block_number == 2)
 			.returning(move |_, _| Ok(()));
 		process_block(
@@ -464,7 +511,7 @@ mod tests {
 			});
 
 		mock_client
-			.expect_store_confidence()
+			.expect_store_verified_cell_count()
 			.withf(move |_, block_number| *block_number == 2)
 			.returning(move |_, _| Ok(()));
 		process_block(

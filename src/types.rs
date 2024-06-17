@@ -1,6 +1,6 @@
 //! Shared light client structs and enums.
 use crate::network::p2p::{MemoryStoreConfig, ProvidersConfig, RocksDBStoreConfig};
-use crate::network::rpc::{Event, Node as RpcNode};
+use crate::network::rpc::Event;
 use crate::utils::{extract_app_lookup, extract_kate};
 use avail_core::DataLookup;
 use avail_subxt::{primitives::Header as DaHeader, utils::H256};
@@ -1145,7 +1145,7 @@ impl IdentityConfig {
 	}
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, Serialize, Deserialize, Decode, Encode)]
 pub struct BlockRange {
 	pub first: u32,
 	pub last: u32,
@@ -1160,21 +1160,6 @@ impl BlockRange {
 	pub fn contains(&self, block_number: u32) -> bool {
 		self.first <= block_number && block_number <= self.last
 	}
-}
-
-#[derive(Default)]
-pub struct State {
-	pub synced: Option<bool>,
-	pub latest: u32,
-	pub header_verified: Option<BlockRange>,
-	pub confidence_achieved: Option<BlockRange>,
-	pub data_verified: Option<BlockRange>,
-	pub sync_latest: Option<u32>,
-	pub sync_header_verified: Option<BlockRange>,
-	pub sync_confidence_achieved: Option<BlockRange>,
-	pub sync_data_verified: Option<BlockRange>,
-	pub finality_synced: bool,
-	pub connected_node: RpcNode,
 }
 
 pub trait OptionBlockRange {

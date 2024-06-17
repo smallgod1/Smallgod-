@@ -4,14 +4,14 @@ use avail_core::AppId;
 use avail_light::{
 	api,
 	consts::EXPECTED_SYSTEM_VERSION,
-	data::rocks_db::RocksDB,
+	data::{Database, IsFinalitySyncedKey, IsSyncedKey, LatestHeaderKey, RocksDB},
 	maintenance::StaticConfigParams,
 	network::{self, p2p, rpc},
 	shutdown::Controller,
 	sync_client::SyncClient,
 	sync_finality::SyncFinality,
 	telemetry::{self, otlp::MetricAttributes, MetricCounter, Metrics},
-	types::{CliOpts, IdentityConfig, LibP2PConfig, Network, OtelConfig, RuntimeConfig, State},
+	types::{CliOpts, IdentityConfig, LibP2PConfig, Network, OtelConfig, RuntimeConfig},
 };
 use clap::Parser;
 use color_eyre::{
@@ -20,12 +20,7 @@ use color_eyre::{
 };
 use kate_recovery::com::AppData;
 use libp2p::{multiaddr::Protocol, Multiaddr};
-use std::{
-	fs,
-	net::Ipv4Addr,
-	path::Path,
-	sync::{Arc, Mutex},
-};
+use std::{fs, net::Ipv4Addr, path::Path, sync::Arc};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{error, info, metadata::ParseLevelError, trace, warn, Level, Subscriber};
 use tracing_subscriber::{fmt::format, EnvFilter, FmtSubscriber};
@@ -225,10 +220,8 @@ async fn run(shutdown: Controller<String>) -> Result<()> {
 	let public_params_len = hex::encode(raw_pp).len();
 	trace!("Public params ({public_params_len}): hash: {public_params_hash}");
 
-	let state = Arc::new(Mutex::new(State::default()));
 	let (rpc_client, rpc_events, rpc_subscriptions) = rpc::init(
 		db.clone(),
-		state.clone(),
 		&cfg.full_node_ws,
 		&cfg.genesis_hash,
 		cfg.retry_config.clone(),
@@ -285,7 +278,8 @@ async fn run(shutdown: Controller<String>) -> Result<()> {
 		},
 	};
 
-	state.lock().unwrap().latest = block_header.number;
+	db.put(LatestHeaderKey, block_header.number)
+		.wrap_err("Coldn't store Latest Header in DB.")?;
 	let sync_range = cfg.sync_range(block_header.number);
 
 	let ws_clients = api::v2::types::WsClients::default();
@@ -295,7 +289,6 @@ async fn run(shutdown: Controller<String>) -> Result<()> {
 		db: db.clone(),
 		cfg: cfg.clone(),
 		identity_cfg,
-		state: state.clone(),
 		version: format!("v{}", clap::crate_version!()),
 		network_version: EXPECTED_SYSTEM_VERSION[0].to_string(),
 		node_client: rpc_client.clone(),
@@ -317,7 +310,6 @@ async fn run(shutdown: Controller<String>) -> Result<()> {
 			app_id,
 			block_tx.subscribe(),
 			pp.clone(),
-			state.clone(),
 			sync_range.clone(),
 			data_tx,
 			shutdown.clone(),
@@ -368,14 +360,14 @@ async fn run(shutdown: Controller<String>) -> Result<()> {
 	);
 
 	if cfg.sync_start_block.is_some() {
-		state.lock().unwrap().synced.replace(false);
+		db.put(IsSyncedKey, Some(false))
+			.expect("Avail Light Client couldn't store IsSynced flag in DB.");
 		tokio::task::spawn(shutdown.with_cancel(avail_light::sync_client::run(
 			sync_client,
 			sync_network_client,
 			(&cfg).into(),
 			sync_range,
 			block_tx.clone(),
-			state.clone(),
 		)));
 	}
 
@@ -384,15 +376,13 @@ async fn run(shutdown: Controller<String>) -> Result<()> {
 		tokio::task::spawn(shutdown.with_cancel(avail_light::sync_finality::run(
 			sync_finality,
 			shutdown.clone(),
-			state.clone(),
 			block_header.clone(),
 		)));
 	} else {
-		let mut s = state
-			.lock()
-			.map_err(|e| eyre!("State mutex is poisoned: {e:#}"))?;
 		warn!("Finality sync is disabled! Implicitly, blocks before LC startup will be considered verified as final");
-		s.finality_synced = true;
+		// set the flag in the db, signaling across that we don't need to sync
+		db.put(IsFinalitySyncedKey, true)
+			.wrap_err("Avail Light Client failed to set IsFinalitySynced flag in DB.")?;
 	}
 
 	let static_config_params = StaticConfigParams {
@@ -436,7 +426,6 @@ async fn run(shutdown: Controller<String>) -> Result<()> {
 			light_network_client,
 			(&cfg).into(),
 			ot_metrics.clone(),
-			state.clone(),
 			channels,
 			shutdown.clone(),
 		)));
